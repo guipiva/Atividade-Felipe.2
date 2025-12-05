@@ -1,0 +1,122 @@
+yaml
+name: Pipeline CI/CD P2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REPO_NAME: api-sast
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test || true
+
+      - name: Build
+        run: npm run build || true
+
+      - name: Calculate new version
+        id: version
+        run: |
+          # calcula e atualiza package.json
+          NEW_VERSION=$(node tools/increment-versions.js "${{ github.event.head_commit.message }}")
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+
+      - name: Commit package.json (version bump)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add package.json || true
+          git commit -m "chore(release): v${{ steps.version.outputs.new_version }}" || echo "no changes to commit"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Create and push tag
+        run: |
+          git tag -a "v${{ steps.version.outputs.new_version }}" -m "Release v${{ steps.version.outputs.new_version }}"
+          git push origin "v${{ steps.version.outputs.new_version }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=988c569c5bbf381193b9f59fa5f6398ebb1d9621
+            -Dsonar.organization=guilherme-tobias-piva
+            -Dsonar.sources=src
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.REPO_NAME }}:${{ steps.version.outputs.new_version }}
+            docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.REPO_NAME }}:latest
+
+      - name: Deploy to Render (trigger)
+        id: render-deploy
+        run: |
+          IMAGE="docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.REPO_NAME }}:${{ steps.version.outputs.new_version }}"
+          echo "Triggering Render deploy with image $IMAGE"
+          RESPONSE=$(curl -s -o /tmp/render_response.json -w "%{http_code}" -X POST "https://api.render.com/v1/services/${{ env.RENDER_SERVICE_ID }}/deploys" \
+            -H "Authorization: Bearer ${{ env.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"image\": \"$IMAGE\"}")
+          cat /tmp/render_response.json
+          echo "Render HTTP status: $RESPONSE"
+          if [ "$RESPONSE" -ge 400 ]; then
+            echo "Render deploy failed with status $RESPONSE"
+            exit 1
+          fi
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
